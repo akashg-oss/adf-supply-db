@@ -1,615 +1,386 @@
 import io
-from datetime import datetime
-import numpy as np
+from datetime import date, timedelta
+
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="FG Supply & Sourcing Control Tower",
+    page_title="FG Supply Control Tower",
     page_icon="📦",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# ============================================================
-# STYLE
-# ============================================================
+# -----------------------------
+# Styling
+# -----------------------------
 st.markdown("""
 <style>
-.block-container {padding-top: 1rem; padding-bottom: 2rem;}
-[data-testid="stMetric"] {
-    border: 1px solid #e5e7eb;
-    border-radius: 12px;
-    padding: 12px;
-    background: white;
-}
-.small-note {color:#6b7280;font-size:12px;}
-.alert-critical {padding:12px;border-radius:10px;border:1px solid #fecaca;background:#fef2f2;}
-.alert-warning {padding:12px;border-radius:10px;border:1px solid #fed7aa;background:#fff7ed;}
-.alert-good {padding:12px;border-radius:10px;border:1px solid #bbf7d0;background:#f0fdf4;}
+    .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
+    .main-title {font-size: 2rem; font-weight: 750; margin-bottom: 0.1rem;}
+    .subtitle {color:#6b7280; margin-bottom:1.2rem;}
+    .kpi {
+        padding: 18px 18px 14px 18px;
+        border: 1px solid #e5e7eb;
+        border-radius: 14px;
+        background: white;
+        min-height: 105px;
+    }
+    .kpi-label {font-size: .82rem; color:#6b7280; font-weight:600;}
+    .kpi-value {font-size: 1.65rem; font-weight:750; margin-top:5px;}
+    .kpi-note {font-size:.75rem; color:#6b7280; margin-top:3px;}
+    .section-title {font-size:1.15rem; font-weight:700; margin-top:1rem;}
+    div[data-testid="stMetric"] {
+        border: 1px solid #e5e7eb; padding: 12px; border-radius: 12px;
+        background: white;
+    }
+    [data-testid="stSidebar"] {border-right:1px solid #e5e7eb;}
+    .status-critical {color:#b91c1c; font-weight:700;}
+    .status-risk {color:#b45309; font-weight:700;}
+    .status-healthy {color:#15803d; font-weight:700;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📦 FG Supply & Sourcing Control Tower")
-st.caption("Version 2 • Demand → Inventory → PO → Dispatch → Receipt → Risk")
 
-# ============================================================
-# HELPERS
-# ============================================================
-def clean_columns(df):
-    df = df.copy()
-    df.columns = [
-        str(c).strip().replace("\n", " ").replace("  ", " ")
-        for c in df.columns
+# -----------------------------
+# Demo data
+# -----------------------------
+@st.cache_data
+def demo_data():
+    today = pd.Timestamp.today().normalize()
+
+    skus = [
+        ("PPLBFC8903380043464NM1", "Faces Canada STAY Oud Till Dawn - 20ml", "ADF", 8200, 2100, 4000, 18),
+        ("PPLBFC8903380042153", "Faces Canada STAY Oud Till Dawn - 50ml", "ADF", 12500, 8400, 5000, 10),
+        ("PPLBFC8903380042184", "Faces Canada STAY Vanilla Past Midnight - 50ml", "ADF", 9800, 1800, 7000, 22),
+        ("PPLBFC8903380042191", "Faces Canada STAY White Moon Light - 50ml", "ADF", 7600, 6100, 3000, 12),
+        ("PPLBFC8903380043402", "Faces Canada Aura Sparkling Ecstacy - 100ml", "ADF", 14500, 3200, 8500, 28),
+        ("PPLBFC8903380042207", "Faces Canada STAY Amber Until Sunset - 50ml", "ADF", 8800, 9500, 2500, 7),
+        ("PPLBFC8903380042139", "Faces Canada Aura Soft Serenity - 100ml", "ADF", 6100, 9000, 1000, 4),
+        ("PPLBFC8903380043396", "Faces Canada Aura Silent Fire - 100ml", "ADF", 7200, 1200, 6000, 25),
+        ("PPLBFC8903380042115", "Faces Canada Aura Romantic Daydreams - 100ml", "ADF", 13200, 2400, 6500, 18),
+        ("PPLBFC8903380042160", "Faces Canada STAY Bloom After Dark - 50ml", "ADF", 6900, 5600, 1200, 8),
+        ("PPLBFC8903380042177", "Faces Canada STAY Sugar After Dusk - 50ml", "ADF", 5400, 4300, 1800, 9),
+        ("PPLBFC8903380042108", "Faces Canada Aura Lovestruck Delight - 100ml", "ADF", 11800, 1500, 9000, 31),
     ]
-    return df
 
-def read_uploaded(uploaded):
-    if uploaded is None:
-        return None
-    if uploaded.name.lower().endswith(".csv"):
-        return clean_columns(pd.read_csv(uploaded))
-    return clean_columns(pd.read_excel(uploaded))
+    sku_df = pd.DataFrame(skus, columns=["SKU Code","SKU Name","Supplier","Monthly Demand","FG Stock","Open PO","Lead Time Days"])
+    sku_df["Daily Demand"] = sku_df["Monthly Demand"] / 30
+    sku_df["Current DOI"] = sku_df["FG Stock"] / sku_df["Daily Demand"]
+    sku_df["Projected Stock"] = sku_df["FG Stock"] + sku_df["Open PO"]
+    sku_df["Projected DOI"] = sku_df["Projected Stock"] / sku_df["Daily Demand"]
+    sku_df["Supply Gap"] = (sku_df["Monthly Demand"] - sku_df["Projected Stock"]).clip(lower=0)
 
-def find_col(df, aliases):
-    if df is None:
-        return None
-    lookup = {str(c).strip().lower(): c for c in df.columns}
-    # exact first
-    for a in aliases:
-        if a.lower() in lookup:
-            return lookup[a.lower()]
-    # then contains
-    for a in aliases:
-        al = a.lower()
-        for c in df.columns:
-            if al in str(c).lower():
-                return c
-    return None
+    def status(r):
+        if r["Current DOI"] < 7 or r["Supply Gap"] > 5000:
+            return "Critical"
+        if r["Current DOI"] < 15 or r["Supply Gap"] > 0:
+            return "Risk"
+        return "Healthy"
 
-def standardize(df, mapping):
-    """Rename source columns into dashboard-standard columns."""
-    if df is None:
-        return None
-    out = df.copy()
-    rename = {}
-    for target, aliases in mapping.items():
-        col = find_col(out, aliases)
-        if col:
-            rename[col] = target
-    out = out.rename(columns=rename)
-    return out
-
-def num(df, col, default=0):
-    if col not in df.columns:
-        df[col] = default
-    df[col] = pd.to_numeric(
-        df[col].astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("₹", "", regex=False)
-        .str.replace("%", "", regex=False)
-        .str.strip(),
-        errors="coerce",
-    ).fillna(default)
-    return df
-
-def date_col(df, col):
-    if col in df.columns:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-    return df
-
-def demo_sources():
-    sku = pd.DataFrame([
-        ["PPLBFC8903380043464NM1","8903380043464","Faces Canada STAY Oud Till Dawn Eau de Parfum - 20ml","ADF"],
-        ["PPLBFC8903380042153","8903380042153","Faces Canada STAY Oud Till Dawn Eau de Parfum - 50ml","ADF"],
-        ["PPLBFC8903380042184","8903380042184","Faces Canada STAY Vanilla Past Midnight Eau de Parfum - 50ml","ADF"],
-        ["PPLBFC8903380042191","8903380042191","Faces Canada STAY White Moon Light Eau de Parfum - 50ml","ADF"],
-        ["PPLBFC8903380043402","8903380043402","Faces Canada Aura Sparkling Ecstacy Eau de Parfum - 100ml","ADF"],
-        ["PPLBFC8903380042207","8903380042207","Faces Canada STAY Amber Until Sunset Eau de Parfum - 50ml","ADF"],
-        ["PPLBFC8903380042139","8903380042139","Faces Canada Aura Soft Serenity Eau de Parfum - 100ml","ADF"],
-        ["PPLBFC8903380043396","8903380043396","Faces Canada Aura Silent Fire Eau de Parfum - 100ml","ADF"],
-        ["PPLBFC8903380042115","8903380042115","Faces Canada Aura Romantic Daydreams Eau de Parfum - 100ml","ADF"],
-        ["PPLBFC8903380042160","8903380042160","Faces Canada STAY Bloom After Dark Eau de Parfum - 50ml","ADF"],
-        ["PPLBFC8903380042177","8903380042177","Faces Canada STAY Sugar After Dusk Eau de Parfum - 50ml","ADF"],
-        ["PPLBFC8903380042108","8903380042108","Faces Canada Aura Lovestruck Delight Eau de Parfum - 100ml","ADF"],
-        ["PPLBFC8903380043495NM8","8903380043495","Faces Canada STAY Vanilla Past Midnight Eau de Parfum mini - 20ml","ADF"],
-        ["PPLBFC8903380042122","8903380042122","Faces Canada Aura Whimsical & Wild Eau de Parfum - 100ml","ADF"],
-        ["PPLBFC8903380043518NM1","8903380043518","Faces Canada STAY Amber Until Sunset Eau de Parfum mini - 20ml","ADF"],
-        ["PPLBFC8903380043488NM4","8903380043488","Faces Canada STAY Sugar After Dusk Eau de Parfum mini - 20ml","ADF"],
-        ["PPLBFC8903380043501NM3","8903380043501","Faces Canada STAY White Moon Light Eau de Parfum mini - 20ml","ADF"],
-        ["PPLBFC8903380043471NM9","8903380043471","Faces Canada STAY Bloom After Dark Eau de Parfum mini - 20ml","ADF"],
-    ], columns=["SKU Code","EAN","SKU Name","Supplier"])
-
-    rng = np.random.default_rng(7)
-    n = len(sku)
-    monthly = rng.integers(35000, 140000, n)
-    stock = rng.integers(5000, 85000, n)
-    open_po = rng.integers(0, 55000, n)
-    transit = rng.integers(0, 25000, n)
-    lead = rng.integers(30, 121, n)
-
-    demand = sku[["SKU Code","SKU Name","Supplier"]].copy()
-    demand["Month"] = "Current"
-    demand["Demand Qty"] = monthly
-
-    inv = sku[["SKU Code","SKU Name","Supplier"]].copy()
-    inv["FG Stock"] = stock
+    sku_df["Status"] = sku_df.apply(status, axis=1)
 
     po_rows = []
-    for i in range(n):
-        po_qty = int(open_po[i])
-        if po_qty:
-            po_rows.append([
-                f"PO-{26000+i}", sku.iloc[i]["SKU Code"], sku.iloc[i]["SKU Name"],
-                "ADF", pd.Timestamp.today().normalize() - pd.Timedelta(days=int(rng.integers(5,35))),
-                pd.Timestamp.today().normalize() + pd.Timedelta(days=int(lead[i])),
-                po_qty, int(po_qty*rng.uniform(.2,.9)), int(po_qty*rng.uniform(.0,.5)),
-                "Confirmed" if rng.random() > .25 else "At Risk"
-            ])
-    po = pd.DataFrame(po_rows, columns=[
-        "PO Number","SKU Code","SKU Name","Supplier","PO Date","Expected Date",
-        "PO Qty","Dispatched Qty","Received Qty","PO Status"
-    ])
-    return sku, demand, inv, po
+    po_specs = [
+        ("PO-ADF-26081", skus[0][0], "ADF", 4000, 2000, 0, today + pd.Timedelta(days=2)),
+        ("PO-ADF-26082", skus[2][0], "ADF", 7000, 0, 0, today - pd.Timedelta(days=3)),
+        ("PO-ADF-26083", skus[4][0], "ADF", 8500, 3500, 0, today + pd.Timedelta(days=9)),
+        ("PO-ADF-26084", skus[7][0], "ADF", 6000, 0, 0, today + pd.Timedelta(days=5)),
+        ("PO-ADF-26085", skus[8][0], "ADF", 6500, 1500, 0, today - pd.Timedelta(days=1)),
+        ("PO-ADF-26086", skus[9][0], "ADF", 1200, 1200, 1200, today - pd.Timedelta(days=5)),
+        ("PO-ADF-26087", skus[11][0], "ADF", 9000, 0, 0, today + pd.Timedelta(days=14)),
+        ("PO-ADF-26088", skus[5][0], "ADF", 2500, 1000, 0, today + pd.Timedelta(days=4)),
+    ]
+    for po, sku, supplier, qty, dispatch, receipt, etd in po_specs:
+        po_rows.append([po, sku, supplier, qty, dispatch, receipt, max(qty-dispatch,0), etd])
+    po_df = pd.DataFrame(
+        po_rows,
+        columns=["PO Number","SKU Code","Supplier","PO Qty","Dispatched Qty","Received Qty","Open Qty","Expected Date"]
+    )
+    po_df["Days to Due"] = (po_df["Expected Date"] - today).dt.days
+    po_df["Delay Days"] = (-po_df["Days to Due"]).clip(lower=0)
+    po_df["Status"] = po_df.apply(
+        lambda r: "Delayed" if r["Delay Days"] > 0 and r["Open Qty"] > 0
+        else ("Open" if r["Open Qty"] > 0 else "Closed"), axis=1
+    )
 
-# ============================================================
-# SOURCE SCHEMAS
-# ============================================================
-SKU_MAP = {
-    "SKU Code": ["SKU Code","SKU","Item Code","Material Code"],
-    "EAN": ["EAN","EAN Code","Barcode","EAN/UPC"],
-    "SKU Name": ["SKU Name","Name of FG","FG Name","Product Name","Description"],
-    "Supplier": ["Supplier","Vendor","Manufacturer","3P Manufacturer"],
-}
-DEMAND_MAP = {
-    "SKU Code": ["SKU Code","SKU","Item Code","Material Code"],
-    "SKU Name": ["SKU Name","Name of FG","FG Name","Product Name","Description"],
-    "Supplier": ["Supplier","Vendor","Manufacturer","3P Manufacturer"],
-    "Demand Qty": ["Demand Qty","Demand","Forecast","Monthly Demand","Requirement","Qty"],
-    "Month": ["Month","Demand Month","Forecast Month"],
-}
-INV_MAP = {
-    "SKU Code": ["SKU Code","SKU","Item Code","Material Code"],
-    "SKU Name": ["SKU Name","Name of FG","FG Name","Product Name","Description"],
-    "Supplier": ["Supplier","Vendor","Manufacturer","3P Manufacturer"],
-    "FG Stock": ["FG Stock","Current Stock","Inventory","FG Inventory","Stock Qty","Closing Stock"],
-}
-PO_MAP = {
-    "PO Number": ["PO Number","PO No","PO","Purchase Order","Purchase Order No"],
-    "SKU Code": ["SKU Code","SKU","Item Code","Material Code"],
-    "SKU Name": ["SKU Name","Name of FG","FG Name","Product Name","Description"],
-    "Supplier": ["Supplier","Vendor","Manufacturer","3P Manufacturer"],
-    "PO Date": ["PO Date","Order Date","Created Date"],
-    "Expected Date": ["Expected Date","Delivery Date","Committed Date","ETA"],
-    "PO Qty": ["PO Qty","PO Quantity","Order Qty","Ordered Qty","Quantity"],
-    "Dispatched Qty": ["Dispatched Qty","Dispatch Qty","Dispatched","Shipped Qty"],
-    "Received Qty": ["Received Qty","GRN Qty","Receipt Qty","Received"],
-    "PO Status": ["PO Status","Status","Delivery Status"],
-}
+    inv_df = sku_df[["SKU Code","SKU Name","Supplier","FG Stock"]].copy()
+    inv_df["As of"] = today
 
-# ============================================================
-# SIDEBAR DATA INPUT
-# ============================================================
-st.sidebar.header("1. Data Inputs")
-use_demo = st.sidebar.checkbox("Use demo data", value=True)
+    demand_df = sku_df[["SKU Code","SKU Name","Monthly Demand"]].copy()
+    demand_df["Month"] = today.strftime("%b-%Y")
 
-sku_file = st.sidebar.file_uploader("SKU / EAN Master", type=["xlsx","xls","csv"], key="sku")
-demand_file = st.sidebar.file_uploader("Demand / Forecast", type=["xlsx","xls","csv"], key="demand")
-inventory_file = st.sidebar.file_uploader("FG Inventory", type=["xlsx","xls","csv"], key="inventory")
-po_file = st.sidebar.file_uploader("Open PO / PO Tracker", type=["xlsx","xls","csv"], key="po")
+    return sku_df, po_df, inv_df, demand_df
 
-if use_demo or not any([sku_file, demand_file, inventory_file, po_file]):
-    sku_raw, demand_raw, inv_raw, po_raw = demo_sources()
-    demo_active = True
-else:
-    sku_raw = read_uploaded(sku_file) if sku_file else None
-    demand_raw = read_uploaded(demand_file) if demand_file else None
-    inv_raw = read_uploaded(inventory_file) if inventory_file else None
-    po_raw = read_uploaded(po_file) if po_file else None
-    demo_active = False
 
-sku = standardize(sku_raw, SKU_MAP)
-demand = standardize(demand_raw, DEMAND_MAP)
-inv = standardize(inv_raw, INV_MAP)
-po = standardize(po_raw, PO_MAP)
+# -----------------------------
+# Helpers
+# -----------------------------
+def money(x):
+    return f"₹{x:,.0f}"
 
-# ============================================================
-# NORMALIZE
-# ============================================================
-for df, cols in [
-    (sku, ["SKU Code","EAN","SKU Name","Supplier"]),
-    (demand, ["SKU Code","SKU Name","Supplier"]),
-    (inv, ["SKU Code","SKU Name","Supplier"]),
-]:
-    if df is not None:
-        for c in cols:
-            if c not in df.columns:
-                df[c] = ""
+def make_kpi(label, value, note=""):
+    st.markdown(
+        f"""<div class="kpi">
+        <div class="kpi-label">{label}</div>
+        <div class="kpi-value">{value}</div>
+        <div class="kpi-note">{note}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
-if demand is not None:
-    num(demand, "Demand Qty")
-if inv is not None:
-    num(inv, "FG Stock")
+def export_excel(sku_df, po_df, inv_df, demand_df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        sku_df.to_excel(writer, index=False, sheet_name="Supply Plan")
+        po_df.to_excel(writer, index=False, sheet_name="PO Tracker")
+        inv_df.to_excel(writer, index=False, sheet_name="FG Inventory")
+        demand_df.to_excel(writer, index=False, sheet_name="Demand")
+    output.seek(0)
+    return output
 
-if po is not None:
-    for c in ["PO Number","SKU Code","SKU Name","Supplier","PO Status"]:
-        if c not in po.columns:
-            po[c] = ""
-    for c in ["PO Qty","Dispatched Qty","Received Qty"]:
-        num(po, c)
-    for c in ["PO Date","Expected Date"]:
-        date_col(po, c)
 
-# ============================================================
-# BUILD SUPPLY MODEL
-# ============================================================
-if sku is None:
-    sku = pd.DataFrame(columns=["SKU Code","EAN","SKU Name","Supplier"])
+# -----------------------------
+# Sidebar
+# -----------------------------
+sku_df, po_df, inv_df, demand_df = demo_data()
 
-master = sku[["SKU Code","EAN","SKU Name","Supplier"]].drop_duplicates("SKU Code")
+st.sidebar.markdown("## 📦 FG Supply Control Tower")
+st.sidebar.caption("Version 2.1 • Demo / Upload Mode")
 
-if demand is None:
-    demand = master[["SKU Code","SKU Name","Supplier"]].copy()
-    demand["Demand Qty"] = 0
-else:
-    demand = demand.groupby("SKU Code", as_index=False).agg({
-        "Demand Qty":"sum",
-        "SKU Name":"first",
-        "Supplier":"first"
-    })
+mode = st.sidebar.radio("Data Mode", ["Demo Mode", "Upload Mode"], index=0)
 
-if inv is None:
-    inv = master[["SKU Code"]].copy()
-    inv["FG Stock"] = 0
-else:
-    inv = inv.groupby("SKU Code", as_index=False)["FG Stock"].sum()
+if mode == "Upload Mode":
+    st.sidebar.markdown("### Upload data")
+    st.sidebar.caption("Upload the four files below. Demo data is used only when Demo Mode is selected.")
+    f_sku = st.sidebar.file_uploader("1. SKU / EAN Master", type=["xlsx","xls","csv"])
+    f_demand = st.sidebar.file_uploader("2. Demand", type=["xlsx","xls","csv"])
+    f_inv = st.sidebar.file_uploader("3. FG Inventory", type=["xlsx","xls","csv"])
+    f_po = st.sidebar.file_uploader("4. Open PO", type=["xlsx","xls","csv"])
 
-if po is None:
-    po = pd.DataFrame(columns=[
-        "PO Number","SKU Code","SKU Name","Supplier","PO Date","Expected Date",
-        "PO Qty","Dispatched Qty","Received Qty","PO Status"
-    ])
+    def read_file(f):
+        if f is None:
+            return None
+        return pd.read_csv(f) if f.name.lower().endswith(".csv") else pd.read_excel(f)
 
-po_summary = po.groupby("SKU Code", as_index=False).agg({
-    "PO Qty":"sum",
-    "Dispatched Qty":"sum",
-    "Received Qty":"sum",
-})
-po_summary["Open PO Qty"] = (
-    po_summary["PO Qty"]
-    - po_summary["Dispatched Qty"]
-    - po_summary["Received Qty"]
-).clip(lower=0)
+    uploaded = [read_file(f_sku), read_file(f_demand), read_file(f_inv), read_file(f_po)]
+    if all(x is not None for x in uploaded):
+        st.sidebar.success("All four files uploaded. Basic mapping will be applied.")
+        # Flexible starter mapping. Expected production mapping can be customized later.
+        m_sku, m_demand, m_inv, m_po = uploaded
+        m_sku.columns = [str(c).strip() for c in m_sku.columns]
+        sku_df = m_sku.copy()
+        # Try to standardize common column names.
+        ren = {}
+        for c in sku_df.columns:
+            lc = c.lower()
+            if "sku code" in lc or lc == "sku":
+                ren[c] = "SKU Code"
+            elif "sku name" in lc or "name" == lc:
+                ren[c] = "SKU Name"
+            elif "supplier" in lc or "vendor" in lc:
+                ren[c] = "Supplier"
+        sku_df = sku_df.rename(columns=ren)
+        if "SKU Code" not in sku_df.columns or "SKU Name" not in sku_df.columns:
+            st.sidebar.error("SKU Master needs SKU Code and SKU Name columns.")
+        else:
+            # Preserve supplied columns; derive operational fields where possible.
+            sku_df["Supplier"] = sku_df.get("Supplier", "Unknown")
+            sku_df["Monthly Demand"] = 0
+            sku_df["FG Stock"] = 0
+            sku_df["Open PO"] = 0
+            sku_df["Lead Time Days"] = 0
+            if "SKU Code" in m_demand.columns:
+                demand_col = next((c for c in m_demand.columns if "demand" in str(c).lower()), None)
+                if demand_col:
+                    dm = m_demand.groupby("SKU Code")[demand_col].sum()
+                    sku_df["Monthly Demand"] = sku_df["SKU Code"].map(dm).fillna(0)
+            if "SKU Code" in m_inv.columns:
+                stock_col = next((c for c in m_inv.columns if any(k in str(c).lower() for k in ["stock","inventory","qty"])), None)
+                if stock_col:
+                    im = m_inv.groupby("SKU Code")[stock_col].sum()
+                    sku_df["FG Stock"] = sku_df["SKU Code"].map(im).fillna(0)
+            if "SKU Code" in m_po.columns:
+                open_col = next((c for c in m_po.columns if "open" in str(c).lower()), None)
+                qty_col = next((c for c in m_po.columns if "po qty" in str(c).lower() or str(c).lower()=="quantity"), None)
+                if open_col:
+                    pm = m_po.groupby("SKU Code")[open_col].sum()
+                elif qty_col:
+                    pm = m_po.groupby("SKU Code")[qty_col].sum()
+                else:
+                    pm = pd.Series(dtype=float)
+                sku_df["Open PO"] = sku_df["SKU Code"].map(pm).fillna(0)
+            sku_df["Daily Demand"] = sku_df["Monthly Demand"] / 30
+            sku_df["Current DOI"] = sku_df["FG Stock"].div(sku_df["Daily Demand"].replace(0, pd.NA)).fillna(999)
+            sku_df["Projected Stock"] = sku_df["FG Stock"] + sku_df["Open PO"]
+            sku_df["Projected DOI"] = sku_df["Projected Stock"].div(sku_df["Daily Demand"].replace(0, pd.NA)).fillna(999)
+            sku_df["Supply Gap"] = (sku_df["Monthly Demand"] - sku_df["Projected Stock"]).clip(lower=0)
+            sku_df["Status"] = sku_df.apply(lambda r: "Critical" if r["Current DOI"] < 7 or r["Supply Gap"] > 5000 else ("Risk" if r["Current DOI"] < 15 or r["Supply Gap"] > 0 else "Healthy"), axis=1)
+            po_df = m_po.copy()
+            inv_df = m_inv.copy()
+            demand_df = m_demand.copy()
+    else:
+        st.sidebar.info("Upload all four files to switch from Demo Mode.")
 
-model = master.merge(
-    demand[["SKU Code","Demand Qty"]], on="SKU Code", how="left"
-).merge(
-    inv[["SKU Code","FG Stock"]], on="SKU Code", how="left"
-).merge(
-    po_summary[["SKU Code","PO Qty","Dispatched Qty","Received Qty","Open PO Qty"]],
-    on="SKU Code", how="left"
-)
+# -----------------------------
+# Header
+# -----------------------------
+st.markdown('<div class="main-title">FG Supply Control Tower</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Finished Goods sourcing, inventory, PO and supplier risk — management view</div>', unsafe_allow_html=True)
 
-for c in ["Demand Qty","FG Stock","PO Qty","Dispatched Qty","Received Qty","Open PO Qty"]:
-    model[c] = pd.to_numeric(model[c], errors="coerce").fillna(0)
-
-model["Net Supply"] = model["FG Stock"] + model["Open PO Qty"]
-model["Supply Gap"] = (model["Demand Qty"] - model["Net Supply"]).clip(lower=0)
-model["DOI"] = np.where(
-    model["Demand Qty"] > 0,
-    model["FG Stock"] / model["Demand Qty"] * 30,
-    999
-)
-model["Projected DOI"] = np.where(
-    model["Demand Qty"] > 0,
-    model["Net Supply"] / model["Demand Qty"] * 30,
-    999
-)
-model["Status"] = np.select(
-    [
-        model["Supply Gap"] > model["Demand Qty"] * 0.20,
-        model["Supply Gap"] > 0,
-        model["DOI"] < 10,
-        model["DOI"] > 60,
-    ],
-    ["Critical","At Risk","Low DOI","Excess"],
-    default="Healthy",
-)
-
-# ============================================================
-# SIDEBAR FILTERS
-# ============================================================
-st.sidebar.header("2. Filters")
-supplier_options = ["All"] + sorted([x for x in model["Supplier"].dropna().astype(str).unique() if x])
-status_options = ["All","Critical","At Risk","Low DOI","Healthy","Excess"]
-
-supplier_filter = st.sidebar.selectbox("Supplier", supplier_options)
-status_filter = st.sidebar.selectbox("Supply Status", status_options)
-
-view = model.copy()
-if supplier_filter != "All":
-    view = view[view["Supplier"].astype(str) == supplier_filter]
-if status_filter != "All":
-    view = view[view["Status"] == status_filter]
-
-# ============================================================
-# HEADER / KPI
-# ============================================================
-if demo_active:
-    st.info("🧪 Demo mode is active. Upload your real Demand, Inventory and PO files in the sidebar to switch to live data.")
-
-critical = int((view["Status"] == "Critical").sum())
-risk = int(view["Status"].isin(["Critical","At Risk","Low DOI"]).sum())
-low_doi = int((view["Status"] == "Low DOI").sum())
-open_po_qty = view["Open PO Qty"].sum()
-gap = view["Supply Gap"].sum()
-stock = view["FG Stock"].sum()
-demand_qty = view["Demand Qty"].sum()
-
-k = st.columns(6)
-k[0].metric("🔴 Critical SKUs", f"{critical:,}")
-k[1].metric("🟠 Risk SKUs", f"{risk:,}")
-k[2].metric("🟡 Low DOI", f"{low_doi:,}")
-k[3].metric("📈 Demand", f"{demand_qty/100000:.2f} L")
-k[4].metric("📦 FG Stock", f"{stock/100000:.2f} L")
-k[5].metric("🚨 Supply Gap", f"{gap/1000:.1f} K")
-
-# ============================================================
-# TABS
-# ============================================================
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🏠 Control Tower",
-    "📋 PO Tracker",
-    "📦 SKU Supply Plan",
-    "🏭 Supplier View",
-    "📊 Data & Export",
+    "🏠 Control Tower", "📋 PO Follow-up", "📦 Inventory & Demand",
+    "🏭 Supplier Performance", "🔎 SKU Drilldown"
 ])
 
-# ============================================================
-# TAB 1 CONTROL TOWER
-# ============================================================
+# -----------------------------
+# Control Tower
+# -----------------------------
 with tab1:
-    st.subheader("Where do I need to act today?")
+    total_demand = sku_df["Monthly Demand"].sum()
+    fg_stock = sku_df["FG Stock"].sum()
+    open_po = sku_df["Open PO"].sum()
+    gap = sku_df["Supply Gap"].sum()
+    critical = int((sku_df["Status"] == "Critical").sum())
+    risk = int((sku_df["Status"] == "Risk").sum())
+    delayed = int((po_df["Status"] == "Delayed").sum()) if "Status" in po_df else 0
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("### 🔴 Top Supply Gaps")
-        gaps = view[view["Supply Gap"] > 0].sort_values("Supply Gap", ascending=False).head(10)
-        if len(gaps):
-            st.dataframe(
-                gaps[["SKU Name","SKU Code","Supplier","Demand Qty","FG Stock","Open PO Qty","Supply Gap","Status"]],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Demand Qty": st.column_config.NumberColumn("Demand", format="%,d"),
-                    "FG Stock": st.column_config.NumberColumn("FG Stock", format="%,d"),
-                    "Open PO Qty": st.column_config.NumberColumn("Open PO", format="%,d"),
-                    "Supply Gap": st.column_config.NumberColumn("Gap", format="%,d"),
-                },
-            )
-        else:
-            st.success("No supply gaps in the selected view.")
+    c = st.columns(6)
+    with c[0]: make_kpi("Monthly Demand", f"{total_demand:,.0f}", "Units")
+    with c[1]: make_kpi("FG Inventory", f"{fg_stock:,.0f}", "Units on hand")
+    with c[2]: make_kpi("Open PO", f"{open_po:,.0f}", "Units inbound")
+    with c[3]: make_kpi("Supply Gap", f"{gap:,.0f}", "After open PO")
+    with c[4]: make_kpi("Critical SKUs", critical, "Immediate action")
+    with c[5]: make_kpi("Delayed POs", delayed, "Need supplier follow-up")
 
-    with c2:
-        st.markdown("### ⏱️ Lowest Inventory Coverage")
-        doi = view.sort_values("DOI", ascending=True).head(10)
-        st.dataframe(
-            doi[["SKU Name","SKU Code","Supplier","FG Stock","Demand Qty","DOI","Status"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "FG Stock": st.column_config.NumberColumn(format="%,d"),
-                "Demand Qty": st.column_config.NumberColumn("Demand", format="%,d"),
-                "DOI": st.column_config.NumberColumn("DOI", format="%.0f days"),
-            },
-        )
+    st.markdown('<div class="section-title">Management Snapshot</div>', unsafe_allow_html=True)
+    left, right = st.columns(2)
 
-    st.markdown("### Supply Position")
-    chart = view.set_index("SKU Name")[["Demand Qty","FG Stock","Open PO Qty"]].sort_values("Demand Qty", ascending=False).head(15)
-    st.bar_chart(chart)
+    with left:
+        st.subheader("SKU Risk Distribution")
+        risk_counts = sku_df["Status"].value_counts().reindex(["Critical","Risk","Healthy"]).fillna(0)
+        st.bar_chart(risk_counts)
 
-    st.markdown("### Status Mix")
-    status_counts = view["Status"].value_counts().reindex(
-        ["Critical","At Risk","Low DOI","Healthy","Excess"], fill_value=0
+    with right:
+        st.subheader("Demand vs Available Supply")
+        chart = sku_df.set_index("SKU Name")[["Monthly Demand","FG Stock","Open PO"]].copy()
+        st.bar_chart(chart)
+
+    st.subheader("🚨 Priority Action List")
+    priority = sku_df.sort_values(["Status","Supply Gap"], ascending=[True, False]).copy()
+    priority["Action"] = priority.apply(
+        lambda r: "Expedite PO / place additional supply" if r["Status"]=="Critical"
+        else ("Confirm supplier dispatch plan" if r["Status"]=="Risk" else "Monitor"),
+        axis=1
     )
-    st.bar_chart(status_counts)
-
-# ============================================================
-# TAB 2 PO TRACKER
-# ============================================================
-with tab2:
-    st.subheader("PO Tracker — follow-up list")
-
-    if len(po):
-        po_view = po.copy()
-
-        today = pd.Timestamp.today().normalize()
-        po_view["Open Qty"] = (
-            po_view["PO Qty"] - po_view["Dispatched Qty"] - po_view["Received Qty"]
-        ).clip(lower=0)
-
-        po_view["Days to Due"] = (po_view["Expected Date"] - today).dt.days
-        po_view["Delay Days"] = np.where(
-            (po_view["Open Qty"] > 0) & po_view["Expected Date"].notna() & (po_view["Expected Date"] < today),
-            (today - po_view["Expected Date"]).dt.days,
-            0,
-        )
-
-        po_view["Action"] = np.select(
-            [
-                po_view["Delay Days"] > 0,
-                (po_view["Days to Due"] <= 7) & (po_view["Open Qty"] > 0),
-                po_view["Open Qty"] <= 0,
-            ],
-            ["🚨 Delayed","⚠️ Due within 7 days","✅ Closed"],
-            default="🟢 Monitor",
-        )
-
-        po_action = st.multiselect(
-            "Show PO actions",
-            ["🚨 Delayed","⚠️ Due within 7 days","🟢 Monitor","✅ Closed"],
-            default=["🚨 Delayed","⚠️ Due within 7 days"],
-        )
-        pv = po_view[po_view["Action"].isin(po_action)] if po_action else po_view
-
-        p1,p2,p3,p4 = st.columns(4)
-        p1.metric("Total POs", f"{len(po_view):,}")
-        p2.metric("Open Qty", f"{po_view['Open Qty'].sum():,.0f}")
-        p3.metric("Delayed POs", f"{(po_view['Delay Days']>0).sum():,}")
-        p4.metric("Due ≤ 7 Days", f"{((po_view['Days to Due']<=7)&(po_view['Open Qty']>0)).sum():,}")
-
-        st.dataframe(
-            pv[[
-                "PO Number","SKU Code","SKU Name","Supplier","PO Date","Expected Date",
-                "PO Qty","Dispatched Qty","Received Qty","Open Qty",
-                "Days to Due","Delay Days","PO Status","Action"
-            ]].sort_values(["Delay Days","Days to Due"], ascending=[False,True]),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "PO Date": st.column_config.DateColumn(format="DD-MMM-YYYY"),
-                "Expected Date": st.column_config.DateColumn(format="DD-MMM-YYYY"),
-                "PO Qty": st.column_config.NumberColumn(format="%,d"),
-                "Dispatched Qty": st.column_config.NumberColumn(format="%,d"),
-                "Received Qty": st.column_config.NumberColumn(format="%,d"),
-                "Open Qty": st.column_config.NumberColumn(format="%,d"),
-            },
-        )
-    else:
-        st.warning("No PO data available. Upload an Open PO / PO Tracker file.")
-
-# ============================================================
-# TAB 3 SKU SUPPLY PLAN
-# ============================================================
-with tab3:
-    st.subheader("SKU-level Supply Plan")
-
-    plan = view[[
-        "SKU Name","SKU Code","EAN","Supplier",
-        "Demand Qty","FG Stock","Open PO Qty","Net Supply",
-        "Supply Gap","DOI","Projected DOI","Status"
-    ]].copy()
-
     st.dataframe(
-        plan.sort_values(["Supply Gap","DOI"], ascending=[False,True]),
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Demand Qty": st.column_config.NumberColumn("Demand", format="%,d"),
-            "FG Stock": st.column_config.NumberColumn("FG Stock", format="%,d"),
-            "Open PO Qty": st.column_config.NumberColumn("Open PO", format="%,d"),
-            "Net Supply": st.column_config.NumberColumn("Net Supply", format="%,d"),
-            "Supply Gap": st.column_config.NumberColumn("Supply Gap", format="%,d"),
-            "DOI": st.column_config.NumberColumn(format="%.0f days"),
-            "Projected DOI": st.column_config.NumberColumn("Projected DOI", format="%.0f days"),
-        },
+        priority[["SKU Code","SKU Name","Supplier","Monthly Demand","FG Stock","Open PO","Supply Gap","Current DOI","Status","Action"]],
+        use_container_width=True, hide_index=True
     )
 
-    st.markdown("### SKU Drilldown")
-    if len(view):
-        selected_sku = st.selectbox("Select SKU", view["SKU Name"].tolist())
-        x = view[view["SKU Name"] == selected_sku].iloc[0]
+# -----------------------------
+# PO Follow-up
+# -----------------------------
+with tab2:
+    st.subheader("PO Follow-up")
+    po_filter = st.multiselect("PO Status", sorted(po_df["Status"].dropna().unique()), default=sorted(po_df["Status"].dropna().unique()))
+    po_view = po_df[po_df["Status"].isin(po_filter)].copy() if po_filter else po_df.iloc[0:0].copy()
 
-        q = st.columns(6)
-        q[0].metric("Demand", f"{x['Demand Qty']:,.0f}")
-        q[1].metric("FG Stock", f"{x['FG Stock']:,.0f}")
-        q[2].metric("Open PO", f"{x['Open PO Qty']:,.0f}")
-        q[3].metric("Net Supply", f"{x['Net Supply']:,.0f}")
-        q[4].metric("DOI", f"{x['DOI']:.0f} days")
-        q[5].metric("Gap", f"{x['Supply Gap']:,.0f}")
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("Open PO Units", f"{po_view['Open Qty'].sum():,.0f}")
+    with c2: st.metric("Delayed POs", int((po_view["Status"]=="Delayed").sum()))
+    with c3: st.metric("Open POs", int((po_view["Open Qty"]>0).sum()))
 
-        related_po = po[po["SKU Code"].astype(str) == str(x["SKU Code"])] if len(po) else pd.DataFrame()
-        if len(related_po):
-            st.markdown("#### Related POs")
-            st.dataframe(related_po, use_container_width=True, hide_index=True)
+    st.dataframe(po_view, use_container_width=True, hide_index=True)
 
-# ============================================================
-# TAB 4 SUPPLIER
-# ============================================================
+    st.subheader("PO Age / Due Profile")
+    due = po_df.copy()
+    due["Bucket"] = pd.cut(
+        due["Days to Due"],
+        bins=[-999, -1, 3, 7, 14, 999],
+        labels=["Delayed", "0–3 days", "4–7 days", "8–14 days", "15+ days"]
+    )
+    st.bar_chart(due.groupby("Bucket", observed=False)["Open Qty"].sum())
+
+# -----------------------------
+# Inventory & Demand
+# -----------------------------
+with tab3:
+    st.subheader("Inventory & Demand")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.metric("Average Current DOI", f"{sku_df['Current DOI'].replace([float('inf')], pd.NA).mean():.1f} days")
+    with d2:
+        st.metric("Average Projected DOI", f"{sku_df['Projected DOI'].replace([float('inf')], pd.NA).mean():.1f} days")
+
+    inv_view = sku_df[["SKU Code","SKU Name","Monthly Demand","FG Stock","Open PO","Current DOI","Projected DOI","Supply Gap","Status"]].copy()
+    st.dataframe(inv_view.sort_values("Current DOI"), use_container_width=True, hide_index=True)
+
+    st.subheader("Lowest DOI")
+    low = sku_df.nsmallest(8, "Current DOI").set_index("SKU Name")[["Current DOI","Projected DOI"]]
+    st.bar_chart(low)
+
+# -----------------------------
+# Supplier Performance
+# -----------------------------
 with tab4:
-    st.subheader("Supplier Performance & Exposure")
+    st.subheader("Supplier Performance")
+    supplier = sku_df.groupby("Supplier", as_index=False).agg(
+        SKUs=("SKU Code","count"),
+        Demand=("Monthly Demand","sum"),
+        FG_Stock=("FG Stock","sum"),
+        Open_PO=("Open PO","sum"),
+        Supply_Gap=("Supply Gap","sum"),
+        Avg_DOI=("Current DOI","mean"),
+        Critical_SKUs=("Status", lambda x: (x=="Critical").sum()),
+        Risk_SKUs=("Status", lambda x: (x=="Risk").sum()),
+    )
+    supplier["Risk Exposure"] = supplier["Supply_Gap"] + supplier["Critical_SKUs"] * 1000
+    st.dataframe(supplier.round(1), use_container_width=True, hide_index=True)
 
-    if len(view):
-        supplier_summary = view.groupby("Supplier", dropna=False).agg(
-            SKUs=("SKU Code","count"),
-            Demand=("Demand Qty","sum"),
-            FG_Stock=("FG Stock","sum"),
-            Open_PO=("Open PO Qty","sum"),
-            Supply_Gap=("Supply Gap","sum"),
-            Avg_DOI=("DOI","mean"),
-        ).reset_index()
+    a, b = st.columns(2)
+    with a:
+        st.subheader("Supplier Open PO")
+        st.bar_chart(supplier.set_index("Supplier")["Open_PO"])
+    with b:
+        st.subheader("Supplier Supply Gap")
+        st.bar_chart(supplier.set_index("Supplier")["Supply_Gap"])
 
-        supplier_summary["Risk SKUs"] = (
-            view.assign(Risk=view["Status"].isin(["Critical","At Risk","Low DOI"]))
-            .groupby("Supplier")["Risk"]
-            .sum()
-            .reindex(supplier_summary["Supplier"])
-            .fillna(0)
-            .astype(int)
-            .values
-        )
-
-        st.dataframe(
-            supplier_summary,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Demand": st.column_config.NumberColumn(format="%,d"),
-                "FG_Stock": st.column_config.NumberColumn("FG Stock", format="%,d"),
-                "Open_PO": st.column_config.NumberColumn("Open PO", format="%,d"),
-                "Supply_Gap": st.column_config.NumberColumn("Supply Gap", format="%,d"),
-                "Avg_DOI": st.column_config.NumberColumn("Avg DOI", format="%.0f days"),
-            },
-        )
-
-        l,r = st.columns(2)
-        with l:
-            st.markdown("### Open PO Exposure by Supplier")
-            st.bar_chart(supplier_summary.set_index("Supplier")["Open_PO"])
-        with r:
-            st.markdown("### Supply Gap by Supplier")
-            st.bar_chart(supplier_summary.set_index("Supplier")["Supply_Gap"])
-
-# ============================================================
-# TAB 5 DATA & EXPORT
-# ============================================================
+# -----------------------------
+# SKU Drilldown
+# -----------------------------
 with tab5:
-    st.subheader("Data Quality & Export")
+    st.subheader("SKU Drilldown")
+    selected = st.selectbox("Select SKU", sku_df["SKU Code"].tolist(), format_func=lambda x: sku_df.loc[sku_df["SKU Code"]==x, "SKU Name"].iloc[0])
+    row = sku_df[sku_df["SKU Code"] == selected].iloc[0]
 
-    dq1,dq2,dq3 = st.columns(3)
-    dq1.metric("SKU Master Rows", f"{len(master):,}")
-    dq2.metric("SKU Rows in Dashboard", f"{len(model):,}")
-    dq3.metric("PO Rows", f"{len(po):,}")
+    st.markdown(f"### {row['SKU Name']}")
+    k = st.columns(6)
+    with k[0]: st.metric("Monthly Demand", f"{row['Monthly Demand']:,.0f}")
+    with k[1]: st.metric("FG Stock", f"{row['FG Stock']:,.0f}")
+    with k[2]: st.metric("Open PO", f"{row['Open PO']:,.0f}")
+    with k[3]: st.metric("Current DOI", f"{row['Current DOI']:.1f} days")
+    with k[4]: st.metric("Projected DOI", f"{row['Projected DOI']:.1f} days")
+    with k[5]: st.metric("Supply Gap", f"{row['Supply Gap']:,.0f}")
 
-    missing = view[view["SKU Code"].astype(str).str.strip() == ""]
-    if len(missing):
-        st.error(f"{len(missing)} rows have missing SKU Code.")
+    sku_pos = po_df[po_df["SKU Code"] == selected].copy()
+    st.subheader("Related POs")
+    if len(sku_pos):
+        st.dataframe(sku_pos, use_container_width=True, hide_index=True)
     else:
-        st.success("SKU codes are populated for the current view.")
+        st.info("No PO records found for this SKU.")
 
-    st.markdown("### Download")
-    export = view.copy()
-    csv_bytes = export.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download Supply Plan CSV",
-        csv_bytes,
-        "FG_Supply_Plan_V2.csv",
-        "text/csv",
-    )
+# -----------------------------
+# Export
+# -----------------------------
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Export")
+xlsx = export_excel(sku_df, po_df, inv_df, demand_df)
+st.sidebar.download_button(
+    "⬇️ Download Dashboard Data",
+    data=xlsx,
+    file_name="FG_Supply_Control_Tower.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
 
-    # Excel export with multiple sheets
-    excel = io.BytesIO()
-    with pd.ExcelWriter(excel, engine="openpyxl") as writer:
-        view.to_excel(writer, index=False, sheet_name="Supply_Plan")
-        po.to_excel(writer, index=False, sheet_name="PO_Tracker")
-        master.to_excel(writer, index=False, sheet_name="SKU_Master")
-    excel.seek(0)
-
-    st.download_button(
-        "⬇️ Download Full Excel Dashboard Data",
-        excel,
-        "FG_Sourcing_Control_Tower_V2.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-st.divider()
-st.caption("Next enhancement: connect this control tower directly to your invoice OCR output, PO data, inventory snapshot and demand file so the dashboard becomes a single daily sourcing cockpit.")
+st.sidebar.caption("Demo Mode uses sample data. Upload Mode is a starter mapping layer for your operational files.")
